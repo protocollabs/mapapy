@@ -116,6 +116,19 @@ def client_process_null_message(ctx):
     data, address = ctx['sk'].recvfrom(4096)
     return client_process_null_reply(ctx, data, address)
 
+def check_time_sync(ctx, reply_data):
+    request_date = maparo_date_parse(reply_data['ts-rp'])
+    now = datetime.datetime.utcnow()
+
+    rtt = now - request_date
+    print("rtt: {}".format(human_timedelta(rtt)))
+
+    time_server = maparo_date_parse(reply_data['ts'])
+
+    ideal_time_server = request_date - (time_server - (rtt / 2.0))
+    print("time delta to server: {}".format(human_timedelta(ideal_time_server)))
+    print("[note: smaller 0: server clock is before client clock, otherwise larger]")
+
 def client_process_info_reply(ctx, data, address):
     if len(data) <= 8:
         raise Exception('message to short, should header and at least one byte')
@@ -126,10 +139,7 @@ def client_process_info_reply(ctx, data, address):
     assert len(data) == length + 8
     json_bytes = data[8:length + 8]
     reply_data = json.loads(json_bytes.decode())
-    request_date = maparo_date_parse(reply_data['ts-rp'])
-    now = datetime.datetime.utcnow()
-    delta = now - request_date
-    print("rtt: {}".format(human_timedelta(delta)))
+    check_time_sync(ctx, reply_data)
     return True
 
 def msg_create_info_msg(ctx):
