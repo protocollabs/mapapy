@@ -31,7 +31,7 @@ def maparo_date_parse(string):
 def init_socket(ctx):
     sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sk.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sk.bind(('localhost', PORT))
+    sk.bind(('', PORT))
     return sk
 
 def srv_msg_null_request(ctx, data, address):
