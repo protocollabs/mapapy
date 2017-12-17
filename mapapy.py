@@ -98,7 +98,7 @@ def client_process_null_reply(ctx, data, address):
         raise Exception('message to short, should header and at least one byte')
     code = struct.unpack('>I', data[0:4])[0]
     if code == 2 and len(data) == NULL_MSG_SIZE:
-        print('receive valid NULL message')
+        print('receive valid null-reply message')
         return True
     else:
         raise Exception('unexpected reply from client!')
@@ -112,33 +112,40 @@ def human_timedelta(timedelta):
 def client_process_null_message(ctx):
     # tx phase
     msg = msg_create_null_msg(ctx)
-    print('send NULL message')
+    print('send null-request message')
     ctx['sk'].sendto(msg, (ctx['args'].addr, PORT))
     # rx phase
     data, address = ctx['sk'].recvfrom(4096)
     return client_process_null_reply(ctx, data, address)
 
-def check_time_sync(ctx, reply_data):
-    now = datetime.datetime.utcnow()
+def check_time_sync(ctx, reply_data, rx_time):
+    now = rx_time
     request_date = maparo_date_parse(reply_data['ts-rp'])
     rtt = now - request_date
     print("rtt: {}".format(human_timedelta(rtt)))
     time_server = maparo_date_parse(reply_data['ts'])
     ideal_time_server = request_date - (time_server - (rtt / 2.0))
     print("time delta to server: {}".format(human_timedelta(ideal_time_server)))
-    print("[Note: smaller 0: server clock is before client clock, otherwise larger]")
+    print("[Note: smaller 0: server clock is before client clock, otherwise behind]")
 
-def client_process_info_reply(ctx, data, address):
+def check_server_info(ctx, reply_data):
+    print("server name: {}".format(reply_data['id'].split("=")[0]))
+    print("arch:        {}".format(reply_data['arch']))
+    print("os:          {}".format(reply_data['os']))
+
+def client_process_info_reply(ctx, data, address, rx_time):
     if len(data) <= 8:
         raise Exception('message to short, should header and at least one byte')
     code, length = struct.unpack('>II', data[0:8])
     if code != PROTOCOL_INFO_REPLY_CODE:
-        print('receive invlid info reply message')
+        print('receive invalid info reply message')
         return False
     assert len(data) == length + 8
+    print('receive valid info-reply message')
     json_bytes = data[8:length + 8]
     reply_data = json.loads(json_bytes.decode())
-    check_time_sync(ctx, reply_data)
+    check_time_sync(ctx, reply_data, rx_time)
+    check_server_info(ctx, reply_data)
     return True
 
 def msg_create_info_msg(ctx):
@@ -146,7 +153,6 @@ def msg_create_info_msg(ctx):
     msg['id'] = "{}={}".format(socket.gethostname(), uuid.uuid4())
     msg['seq'] = 0
     msg['ts'] = maparo_date()
-    print("T1: client time send {}".format(maparo_date()))
     json_bytes = str.encode(json.dumps(msg))
     b = struct.pack('>II', PROTOCOL_INFO_REQUEST_CODE, len(json_bytes))
     return b + json_bytes
@@ -154,11 +160,12 @@ def msg_create_info_msg(ctx):
 def client_process_info_message(ctx):
     # tx phase
     msg = msg_create_info_msg(ctx)
-    print('send INFO message')
+    print('send info-request message')
     ctx['sk'].sendto(msg, (ctx['args'].addr, PORT))
     # rx phase
     data, address = ctx['sk'].recvfrom(4096)
-    return client_process_info_reply(ctx, data, address)
+    rx_time = datetime.datetime.utcnow()
+    return client_process_info_reply(ctx, data, address, rx_time)
 
 
 def mode_client(ctx):
