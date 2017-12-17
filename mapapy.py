@@ -23,6 +23,8 @@ def maparo_date():
     dt = datetime.datetime.utcnow()
     return dt.strftime('%Y-%m-%dT%H:%M:%S.%f')
 
+# XXX strptime seem to consume WAY to much resourches.
+# on amd64 box it takes 2 milliseconds
 def maparo_date_parse(string):
     return datetime.datetime.strptime(string, '%Y-%m-%dT%H:%M:%S.%f')
 
@@ -105,7 +107,7 @@ def timedelta_ms(timedelta):
     return timedelta.total_seconds() * 1000.0
 
 def human_timedelta(timedelta):
-    return '{} ms'.format(timedelta_ms(timedelta))
+    return '{0:.3f} ms'.format(timedelta_ms(timedelta))
 
 def client_process_null_message(ctx):
     # tx phase
@@ -117,17 +119,14 @@ def client_process_null_message(ctx):
     return client_process_null_reply(ctx, data, address)
 
 def check_time_sync(ctx, reply_data):
-    request_date = maparo_date_parse(reply_data['ts-rp'])
     now = datetime.datetime.utcnow()
-
+    request_date = maparo_date_parse(reply_data['ts-rp'])
     rtt = now - request_date
     print("rtt: {}".format(human_timedelta(rtt)))
-
     time_server = maparo_date_parse(reply_data['ts'])
-
     ideal_time_server = request_date - (time_server - (rtt / 2.0))
     print("time delta to server: {}".format(human_timedelta(ideal_time_server)))
-    print("[note: smaller 0: server clock is before client clock, otherwise larger]")
+    print("[Note: smaller 0: server clock is before client clock, otherwise larger]")
 
 def client_process_info_reply(ctx, data, address):
     if len(data) <= 8:
@@ -147,6 +146,7 @@ def msg_create_info_msg(ctx):
     msg['id'] = "{}={}".format(socket.gethostname(), uuid.uuid4())
     msg['seq'] = 0
     msg['ts'] = maparo_date()
+    print("T1: client time send {}".format(maparo_date()))
     json_bytes = str.encode(json.dumps(msg))
     b = struct.pack('>II', PROTOCOL_INFO_REQUEST_CODE, len(json_bytes))
     return b + json_bytes
