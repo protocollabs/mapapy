@@ -52,6 +52,7 @@ def srv_msg_info_request(ctx, data, address):
     reply_data['ts'] = maparo_date()
     reply_data['arch'] = 'unknown'
     reply_data['os'] = 'unknown'
+    reply_data['modules'] = { 'udp-pulser' : {} }
     json_bytes = str.encode(json.dumps(reply_data))
     b = struct.pack('>II', PROTOCOL_INFO_REPLY_CODE, len(json_bytes))
     buf = b + json_bytes
@@ -132,6 +133,7 @@ def check_server_info(ctx, reply_data):
     print("server name: {}".format(reply_data['id'].split("=")[0]))
     print("arch:        {}".format(reply_data['arch']))
     print("os:          {}".format(reply_data['os']))
+    print("modules supported: {}".format(",".join(reply_data['modules'].keys())))
 
 def client_process_info_reply(ctx, data, address, rx_time):
     if len(data) <= 8:
