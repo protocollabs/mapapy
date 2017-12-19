@@ -19,6 +19,7 @@ PROTOCOL_INFO_REPLY_CODE    = 4
 PROTOCOL_START_REQUEST_CODE = 5
 PROTOCOL_START_REPLY_CODE   = 6
 
+MODULE_UDP_PULSER_NAME = '_udp-pulser'
 
 NULL_MSG_SIZE = 512
 
@@ -58,11 +59,35 @@ def srv_msg_info_request(ctx, data, address):
     reply_data['ts'] = maparo_date()
     reply_data['arch'] = 'unknown'
     reply_data['os'] = 'unknown'
-    reply_data['modules'] = { '_udp-pulser' : {} }
+    reply_data['modules'] = { MODULE_UDP_PULSER_NAME : {} }
     json_bytes = str.encode(json.dumps(reply_data))
     b = struct.pack('>II', PROTOCOL_INFO_REPLY_CODE, len(json_bytes))
     buf = b + json_bytes
     ctx['sk'].sendto(buf, address)
+
+def init_v4_rx_fd(port):
+	s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+	s.setblocking(False)
+	s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+	if hasattr(s, "SO_REUSEPORT"):
+		s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+	s.bind(('', int(port)))
+	return s
+
+def srv_msg_start_request_process(ctx, request_data):
+    module_name = request_data['module']['name']
+    if module_name != MODULE_UDP_PULSER_NAME:
+        return False, 'module ({}) not supported'.format(module_name)
+    ctx['db-srv'] = dict()
+    for entry in request_data['module']['configuration']['streams']:
+        port = entry['port']
+        ctx['db-srv'][port] = dict()
+        ctx['db-srv'][port]['name'] = entry['stream']
+        ctx['db-srv'][port]['fd'] = init_v4_rx_fd(port)
+        ctx['db-srv'][port]['sequence-expected'] = 0
+        ctx['db-srv'][port]['packets-reqeived'] = 0
+        ctx['db-srv'][port]['bytes-received'] = 0
+    return True, ""
 
 def srv_msg_start_request(ctx, data, address):
     json_len = struct.unpack('>I', data[4:8])[0]
@@ -70,7 +95,16 @@ def srv_msg_start_request(ctx, data, address):
         raise Exception('packet is smaller as expected')
     json_bytes = data[8:json_len + 8]
     request_data = json.loads(json_bytes.decode())
+    ok, msg = srv_msg_start_request_process(ctx, request_data)
     reply_data = dict()
+    reply_data['seq-rq'] = request_data['seq']
+    if not ok:
+        # return with failure
+        reply_data['status'] = 'failed'
+        reply_data['message'] = msg
+    else:
+        # return with success
+        reply_data['status'] = 'ok'
     json_bytes = str.encode(json.dumps(reply_data))
     b = struct.pack('>II', PROTOCOL_START_REPLY_CODE, len(json_bytes))
     buf = b + json_bytes
@@ -167,7 +201,7 @@ def check_server_info(ctx, reply_data):
     print("arch:        {}".format(reply_data['arch']))
     print("os:          {}".format(reply_data['os']))
     print("modules supported: {}".format(",".join(reply_data['modules'].keys())))
-    if not '_udp-pulser' in reply_data['modules']:
+    if not MODULE_UDP_PULSER_NAME in reply_data['modules']:
         print("udp pulser module not suported by server")
         return False
     return True
@@ -205,18 +239,37 @@ def client_process_info_message(ctx):
     rx_time = datetime.datetime.utcnow()
     return client_process_info_reply(ctx, data, address, rx_time)
 
+def client_start_request_prep_conf(ctx):
+    d = dict()
+    streams = []
+    port = int(ctx['conf']['start_port'])
+    for i, stream in enumerate(ctx['conf']['streams']):
+        entry = dict()
+        entry['port'] = str(port)
+        entry['stream'] = str(i)
+        port += 1
+        streams.append(entry)
+    d['streams'] = streams
+    return d
+
 def msg_create_start_request(ctx):
     msg = dict()
     msg['id'] = maparo_id()
     msg['seq'] = 0
     msg['module'] = dict()
-    msg['module']['name'] = '_udp_pulser'
-    msg['module']['mode'] = 'server'
-    msg['module']['configuration'] = ctx['conf']
+    msg['module']['name'] = MODULE_UDP_PULSER_NAME
+    msg['module']['configuration'] = client_start_request_prep_conf(ctx)
     pprint.pprint(msg)
     json_bytes = str.encode(json.dumps(msg))
     b = struct.pack('>II', PROTOCOL_START_REQUEST_CODE, len(json_bytes))
     return b + json_bytes
+
+def client_check_start_reply(ctx, msg):
+    if msg['status'] != 'ok':
+        print('failed to connect to server')
+        print('server message: \"{}\"'.format(msg['message']))
+        return False
+    return True
 
 def client_process_start_reply(ctx, data, address):
     if len(data) <= 8:
@@ -229,8 +282,7 @@ def client_process_start_reply(ctx, data, address):
     print('receive valid start-reply message')
     json_bytes = data[8:length + 8]
     reply_data = json.loads(json_bytes.decode())
-    #check_time_sync(ctx, reply_data, rx_time)
-    #return check_server_info(ctx, reply_data)
+    return client_check_start_reply(ctx, reply_data)
 
 def client_process_start_message(ctx):
     msg = msg_create_start_request(ctx)
