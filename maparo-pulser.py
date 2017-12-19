@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import asyncio
 import socket
 import sys
 import argparse
@@ -8,6 +9,7 @@ import uuid
 import datetime
 import json
 import pprint
+import functools
 
 
 PORT = 64321
@@ -74,6 +76,26 @@ def init_v4_rx_fd(port):
 	s.bind(('', int(port)))
 	return s
 
+def srv_handle_pulses(ctx, port, now, msg):
+    print('receive packet on port {}'.format(port))
+
+
+def srv_cb_v4_rx(fd, ctx, port):
+    try:
+        msg, addr = fd.recvfrom(16600)
+        now = maparo_date()
+    except socket.error as e:
+        print('Expection')
+    srv_handle_pulses(ctx, port, now, msg)
+
+
+def srv_handle_control(fd, ctx):
+    try:
+        msg, addr = fd.recvfrom(16600)
+    except socket.error as e:
+        print('Expection')
+    print('receive control packet - HANDLE ME')
+
 def srv_msg_start_request_process(ctx, request_data):
     module_name = request_data['module']['name']
     if module_name != MODULE_UDP_PULSER_NAME:
@@ -87,7 +109,14 @@ def srv_msg_start_request_process(ctx, request_data):
         ctx['db-srv'][port]['sequence-expected'] = 0
         ctx['db-srv'][port]['packets-reqeived'] = 0
         ctx['db-srv'][port]['bytes-received'] = 0
+        fd = ctx['db-srv'][port]['fd']
+        ctx['loop'].add_reader(fd, functools.partial(srv_cb_v4_rx, fd, ctx, port))
     return True, ""
+
+def srv_switch_nonblocking_control(ctx):
+    ctx['sk'].setblocking(False)
+    ctx['loop'].add_reader(ctx['sk'], functools.partial(srv_handle_control, ctx['sk'], ctx))
+    ctx['non-blocking'] = True
 
 def srv_msg_start_request(ctx, data, address):
     json_len = struct.unpack('>I', data[4:8])[0]
@@ -105,6 +134,7 @@ def srv_msg_start_request(ctx, data, address):
     else:
         # return with success
         reply_data['status'] = 'ok'
+
     json_bytes = str.encode(json.dumps(reply_data))
     b = struct.pack('>II', PROTOCOL_START_REPLY_CODE, len(json_bytes))
     buf = b + json_bytes
@@ -124,6 +154,9 @@ def server_recv_loop(ctx):
             srv_msg_info_request(ctx, data, address)
         elif code == PROTOCOL_START_REQUEST_CODE:
             srv_msg_start_request(ctx, data, address)
+            srv_switch_nonblocking_control(ctx)
+            ctx['loop'].run_forever()
+            return
         else:
             print('unhandled message code: {}'.format(code))
             continue
@@ -151,7 +184,11 @@ def init_ctx():
     conf = None
     if not args.daemon:
         conf = load_configuration_file(args)
-    return { 'args' : args, 'conf' : conf }
+    d = dict()
+    d['args'] = args
+    d['conf'] = conf
+    d['loop'] = asyncio.get_event_loop()
+    return d
 
 def mode_server(ctx):
     ctx['sk'] = init_socket(ctx)
@@ -291,8 +328,47 @@ def client_process_start_message(ctx):
     data, address = ctx['sk'].recvfrom(4096)
     return client_process_start_reply(ctx, data, address)
 
+def init_v4_tx_fd():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    return s
+
+def client_tx(ctx, i):
+    print_data = dict()
+    addr = ctx['conf']['destination_addr']
+    port = ctx['conf']['start_port'] + int(i)
+    #msg, seq_no = message(ctx, d, i)
+    ctx['tx-fd'].sendto(bytearray(10), (addr, port))
+    #print_data['tx-time'] = high_res_timestamp()
+    #print_data['stream'] = stream_name
+    #print_data['seq-no'] = seq_no
+    #print_data['payload-size'] = len(msg)
+    #print_tx(print_data)
+
+async def burst_mode(ctx, i, stream):
+    no_packets = stream['bursts-packets']
+    for packet_counter in range(0, no_packets):
+        client_tx(ctx, i)
+        if packet_counter == no_packets -1:
+            # after the last transmission we do not wait
+            return
+        await asyncio.sleep(stream['burst-intra-time'])
+
+async def tx_thread(ctx, i, stream):
+    if 'initial-waittime' in stream:
+        await asyncio.sleep(float(stream['initial-waittime']))
+    while True:
+        await burst_mode(ctx, i, stream)
+        await asyncio.sleep(stream['burst-inter-time'])
+
+def client_pulsing(ctx):
+    for i, stream in enumerate(ctx['conf']['streams']):
+        asyncio.ensure_future(tx_thread(ctx, i, stream))
+    ctx['loop'].run_forever()
+
 def mode_client(ctx):
     ctx['sk'] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    ctx['tx-fd'] = init_v4_tx_fd()
     ok = client_process_null_message(ctx)
     if not ok:
         print("failed to process null message")
@@ -305,6 +381,7 @@ def mode_client(ctx):
     if not ok:
         print("failed to process start message")
         return
+    client_pulsing(ctx)
 
 def main():
     ctx = init_ctx()
