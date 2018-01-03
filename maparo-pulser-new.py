@@ -12,6 +12,7 @@ import pprint
 import functools
 import time
 import ipaddress
+import enum
 
 CTRL_MCAST_ADDR_V4 = '224.0.0.1'
 CTRL_MCAST_ADDR_V6 = 'FF02::1'
@@ -24,18 +25,21 @@ CTRL_MCAST_TTL = 1
 
 CTRL_PORT = 64321
 
-CTRL_DGRAM_BUF_SIZE 4096
+CTRL_DGRAM_BUF_SIZE = 4096
 
-PROTOCOL_NULL_REQUEST_CODE  = 1
-PROTOCOL_NULL_REPLY_CODE    = 2
+# how many probes to send within a row to
+# probe for time differences between client
+# and server.
+CTRL_RTT_ROUNDS = 5
+
+PROTOCOL_RTT_REQUEST_CODE   = 1
+PROTOCOL_RTT_REPLY_CODE     = 2
 PROTOCOL_INFO_REQUEST_CODE  = 3
 PROTOCOL_INFO_REPLY_CODE    = 4
 PROTOCOL_START_REQUEST_CODE = 5
 PROTOCOL_START_REPLY_CODE   = 6
 
 MODULE_UDP_PULSER_NAME = '_udp-pulser'
-
-NULL_MSG_SIZE = 512
 
 def maparo_id():
     return "{}={}".format(socket.gethostname(), uuid.uuid4())
@@ -52,12 +56,16 @@ def maparo_date_parse(string):
 
 class Client(object):
 
-    STATES = [ 'RTT1', 'RTT2', 'INFO', 'MODULE-START', 'MODULE-STOP' ]
+    STATES = enum.Enum('States', 'RTT INFO MODULE_START MODULE_STOP')
 
     def __init__(self, args):
         self.args = args
+        self.rtt_round = 0
+        self.rtt_round_max = CTRL_RTT_ROUNDS
+        self.rtt_db = list()
         self.state = None
         self.loop = asyncio.get_event_loop()
+        self.time_diff = args.time_difference
 
     def init_ctrl_mcast(self, addr):
         if addr.version == 4:
@@ -78,12 +86,85 @@ class Client(object):
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         return sock
 
+    def ctrl_process_rtt_reply_check(self, reply_data):
+        if reply_data['seq-rp'] != self.state_ctx['seq']:
+            print('sequence number not identical')
+            return False
+        return True
+
+    def ctrl_process_rtt_reply_check_time_sync(self, reply_data, now):
+        request_date = maparo_date_parse(reply_data['ts-rp'])
+        rtt = now - request_date
+        print("rtt: {}".format(human_timedelta(rtt)))
+        time_server = maparo_date_parse(reply_data['ts'])
+        ideal_time_server = request_date - (time_server - (rtt / 2.0))
+        print("time delta to server: {}".format(human_timedelta(ideal_time_server)))
+        print("[Note: smaller 0: server clock is before client clock, otherwise behind]")
+        self.rtt_db.append((rtt, ideal_time_server))
+
+    def ctrl_process_rtt_reply(self, data, addr, now):
+        if len(data) <= 8:
+            raise Exception('message to short, should header and at least one byte')
+        code, length = struct.unpack('>II', data[0:8])
+        if code != PROTOCOL_RTT_REPLY_CODE:
+            print('receive invalid rtt reply message')
+            return False
+        assert len(data) == length + 8
+        print('receive valid rtt reply message')
+        json_bytes = data[8:length + 8]
+        reply_msg = json.loads(json_bytes.decode())
+        ok = self.ctrl_process_rtt_reply_check(reply_msg)
+        if not ok:
+            return False
+        self.ctrl_process_rtt_reply_check_time_sync(reply_msg, now)
+        if self.rtt_round < self.rtt_round_max - 1:
+            self.rtt_round += 1
+            asyncio.ensure_future(self.tx_msg_rtt(self.rtt_round))
+        else:
+            # ok, we now check for the smallest diff, this is probably
+            # now the sanest way to do, but what is a better way anyway?
+            # Take the diff where the the rtt is the smallest?
+            min_diff_abs = None
+            min_diff = None
+            for i in self.rtt_db:
+                if min_diff_abs == None or min_diff_abs > abs(i[1]):
+                    min_diff_abs = abs(i[1])
+                    min_diff = i[1]
+            if self.time_diff:
+                print("Your time difference: {} ms".format(self.time_diff))
+                print(' measuremtn time difference {}'.format(human_timedelta(min_diff)))
+                print(' But will take the given time as difference calculation!')
+            else:
+                self.time_diff = timedelta_ms(min_diff)
+                print("Calculated time difference: {} ms".format(self.time_diff))
+
+        return True
+
+
+    def ctrl_multiplex_msg(self, data, addr, now):
+        if len(data) <= 4:
+            raise Exception('message to short, should header and at least one byte')
+        code = struct.unpack('>I', data[0:4])[0]
+        if code == PROTOCOL_RTT_REPLY_CODE and self.state == Client.STATES.RTT:
+            ok = self.ctrl_process_rtt_reply(data, addr, now)
+            if not ok:
+                return
+        else:
+            print('unexpected message')
+
+
     def ctrl_multiplex(self, fd):
         try:
-            print("receive control data")
             data, addr = fd.recvfrom(CTRL_DGRAM_BUF_SIZE)
+            now = datetime.datetime.utcnow()
+            ok = self.ctrl_multiplex_msg(data, addr, now)
+            if not ok:
+                return
         except:
             raise
+
+    def finish(self):
+        self.loop.stop()
 
     def init_ctrl(self):
         # now check for ctrl channel
@@ -100,15 +181,24 @@ class Client(object):
         self.loop.add_reader(self.ctrl_sock,
                 functools.partial(self.ctrl_multiplex, self.ctrl_sock))
 
-    async def main_loop(self):
-        while True:
-            self.ctrl_sock.sendto(bytearray(10), self.ctrl_addr)
-            await asyncio.sleep(1.)
-            print("wait")
+    def msg_create_rtt_request(self, seq):
+        msg = dict()
+        msg['id'] = maparo_id()
+        msg['seq'] = seq
+        msg['ts'] = maparo_date()
+        json_bytes = str.encode(json.dumps(msg))
+        b = struct.pack('>II', PROTOCOL_RTT_REQUEST_CODE, len(json_bytes))
+        return b + json_bytes, msg
+
+    async def tx_msg_rtt(self, seq):
+        msg, meta = self.msg_create_rtt_request(seq)
+        self.ctrl_sock.sendto(msg, self.ctrl_addr)
+        self.state = Client.STATES.RTT
+        self.state_ctx = meta
 
     def run(self):
         self.init_ctrl()
-        asyncio.ensure_future(self.main_loop())
+        asyncio.ensure_future(self.tx_msg_rtt(0))
         try:
             self.loop.run_forever()
         finally:
@@ -154,19 +244,52 @@ class Server(object):
         sock.bind((CTRL_MCAST_ADDR_V4, CTRL_PORT))
         host = socket.gethostbyname(socket.gethostname())
         sock.setsockopt(socket.SOL_IP, socket.IP_MULTICAST_IF, socket.inet_aton(host))
-        #mreq = struct.pack("4sl", socket.inet_aton(addr), socket.INADDR_ANY)
-        #sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
         sock.setsockopt(socket.SOL_IP, socket.IP_ADD_MEMBERSHIP,
                         socket.inet_aton(CTRL_MCAST_ADDR_V4) + socket.inet_aton(host))
         return sock
+
+    def ctrl_process_rtt_request_pkt(self, data):
+        json_len = struct.unpack('>I', data[4:8])[0]
+        if len(data) - (4 + 4) < json_len:
+            return False, None
+        json_bytes = data[8:json_len + 8]
+        msg = json.loads(json_bytes.decode())
+        return True, msg
+
+    def ctrl_create_rtt_reply(self, msg):
+        reply_data = dict()
+        reply_data['id'] = maparo_id()
+        reply_data['seq-rp'] = msg['seq']
+        reply_data['ts-rp'] = msg['ts']
+        reply_data['ts'] = maparo_date()
+        json_bytes = str.encode(json.dumps(reply_data))
+        b = struct.pack('>II', PROTOCOL_RTT_REPLY_CODE, len(json_bytes))
+        return b + json_bytes
+
+    def ctrl_process_rtt_request(self, fd, data, addr):
+        ok, msg = self.ctrl_process_rtt_request_pkt(data)
+        if not ok:
+            return
+        reply_data = self.ctrl_create_rtt_reply(msg)
+        fd.sendto(reply_data, addr)
 
     def ctrl_multiplex(self, name, fd):
         try:
             data, addr = fd.recvfrom(CTRL_DGRAM_BUF_SIZE)
         except:
             raise
-        fd.sendto(bytearray(11), addr)
-        print(len(data))
+        if len(data) <= 4:
+            print('message to short, should header and at least one byte')
+            return
+        code = struct.unpack('>I', data[0:4])[0]
+        if code == PROTOCOL_RTT_REQUEST_CODE:
+            self.ctrl_process_rtt_request(fd, data, addr)
+        else:
+            print('unknown message type: {}'.format(code))
+        #elif code == PROTOCOL_INFO_REQUEST_CODE:
+        #    srv_msg_info_request(ctx, data, address)
+        #fd.sendto(bytearray(11), addr)
+        #print(len(data))
 
     def init_ctrl_channels(self):
         """ open a unicast and multicast udp server socket """
@@ -177,9 +300,11 @@ class Server(object):
         self.loop.add_reader(fd, functools.partial(self.ctrl_multiplex, "v6-mcast", fd))
 
 
+def timedelta_ms(timedelta):
+    return timedelta.total_seconds() * 1000.0
 
-
-
+def human_timedelta(timedelta):
+    return '{0:.3f} ms'.format(timedelta_ms(timedelta))
 
 def canonical(sock, ip):
     family = getattr(sock, 'family', sock)
@@ -201,6 +326,7 @@ def parse_args():
     parser.add_argument("--daemon", action='store_true', default=False)
     parser.add_argument('--addr', action="store",  type=str, default="::1")
     parser.add_argument('--ctrl-addr', action="store",  type=str, default=None)
+    parser.add_argument('--time-difference', action="store",  type=float, default=None)
     parser.add_argument("-v", "--verbose", action="count", default=0,
                         help="increase output verbosity")
     args = parser.parse_args()
