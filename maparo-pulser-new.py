@@ -32,6 +32,10 @@ CTRL_DGRAM_BUF_SIZE = 4096
 # and server.
 CTRL_RTT_ROUNDS = 5
 
+# If server did not answer, retry within
+# n seconds again.
+CTRL_RTT_TIMEOUT = 3
+
 PROTOCOL_RTT_REQUEST_CODE   = 1
 PROTOCOL_RTT_REPLY_CODE     = 2
 PROTOCOL_INFO_REQUEST_CODE  = 3
@@ -66,6 +70,7 @@ class Client(object):
         self.state = None
         self.loop = asyncio.get_event_loop()
         self.time_diff = args.time_difference
+        self.task_rtt_timeout = None
 
     def init_ctrl_mcast(self, addr):
         if addr.version == 4:
@@ -103,6 +108,10 @@ class Client(object):
         self.rtt_db.append((rtt, ideal_time_server))
 
     def ctrl_process_rtt_reply(self, data, addr, now):
+        # first of all, cancel the timer if one was
+        # registered
+        assert self.task_rtt_timeout != None
+        self.task_rtt_timeout.cancel()
         if len(data) <= 8:
             raise Exception('message to short, should header and at least one byte')
         code, length = struct.unpack('>II', data[0:8])
@@ -190,15 +199,24 @@ class Client(object):
         b = struct.pack('>II', PROTOCOL_RTT_REQUEST_CODE, len(json_bytes))
         return b + json_bytes, msg
 
+    async def ctrl_rtt_timeout(self, seconds):
+        await asyncio.sleep(seconds)
+        print('server did not respone within {} seconds, retry again now'.format(seconds))
+        asyncio.ensure_future(self.tx_msg_rtt(self.rtt_round))
+
+
     async def tx_msg_rtt(self, seq):
         msg, meta = self.msg_create_rtt_request(seq)
         self.ctrl_sock.sendto(msg, self.ctrl_addr)
         self.state = Client.STATES.RTT
         self.state_ctx = meta
+        # ok, wait maximum 3 seconds for reply messages
+        self.task_rtt_timeout = asyncio.ensure_future(self.ctrl_rtt_timeout(CTRL_RTT_TIMEOUT))
+
 
     def run(self):
         self.init_ctrl()
-        asyncio.ensure_future(self.tx_msg_rtt(0))
+        asyncio.ensure_future(self.tx_msg_rtt(self.rtt_round))
         try:
             self.loop.run_forever()
         finally:
