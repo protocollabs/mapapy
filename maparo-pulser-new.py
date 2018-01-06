@@ -13,6 +13,7 @@ import functools
 import time
 import ipaddress
 import enum
+import os
 
 CTRL_MCAST_ADDR_V4 = '224.0.0.1'
 CTRL_MCAST_ADDR_V6 = 'FF02::1'
@@ -48,15 +49,28 @@ CTRL_INFO_ROUNDS = 5
 # Wait for n seconds after which all received
 # messages should be processed. Note that the
 # number do not correltate to CTRL_INFO_ROUNDS
-CTRL_INFO_TIMEOUT = 5
+CTRL_INFO_TIMEOUT = 1
+
+# wait max n seconds until the reply must be received
+# if not resend the message
+CTRL_MEASUREMENT_START_TIMEOUT = 1
 
 
-PROTOCOL_RTT_REQUEST_CODE   = 1
-PROTOCOL_RTT_REPLY_CODE     = 2
-PROTOCOL_INFO_REQUEST_CODE  = 3
-PROTOCOL_INFO_REPLY_CODE    = 4
-PROTOCOL_START_REQUEST_CODE = 5
-PROTOCOL_START_REPLY_CODE   = 6
+PROTOCOL_INFO_REQUEST_CODE  = 1
+PROTOCOL_INFO_REPLY_CODE    = 2
+
+PROTOCOL_MEASUREMENT_START_REQUEST_CODE = 3
+PROTOCOL_MEASUREMENT_START_REPLY_CODE   = 4
+
+PROTOCOL_MEASUREMENT_STOP_REQUEST_CODE = 5
+PROTOCOL_MEASUREMENT_STOP_REPLY_CODE   = 6
+
+PROTOCOL_MEASUREMENT_INFO_REQUEST_CODE = 7
+PROTOCOL_MEASUREMENT_INFO_REPLY_CODE   = 8
+
+PROTOCOL_RTT_REQUEST_CODE   = 9
+PROTOCOL_RTT_REPLY_CODE     = 10
+
 
 MODULE_UDP_PULSER_NAME = '_udp-pulser'
 
@@ -77,10 +91,11 @@ def maparo_date_parse(string):
 
 class Client(object):
 
-    STATES = enum.Enum('States', 'RTT INFO MODULE_START MODULE_STOP')
+    STATES = enum.Enum('States', 'RTT INFO MEASUREMENT_START MEASUREMENT MEASURMENT_STOP')
 
-    def __init__(self, args):
+    def __init__(self, args, conf):
         self.args = args
+        self.conf = conf
         self.rtt_round = 0
         self.rtt_round_max = CTRL_RTT_ROUNDS
         self.info_round = 0
@@ -167,7 +182,8 @@ class Client(object):
             else:
                 self.time_diff = timedelta_ms(min_diff)
                 print("Calculated time difference: {} ms".format(self.time_diff))
-
+            # ok, last round, now switch to next mode
+            asyncio.ensure_future(self.measurment_start())
         return True
 
     def ctrl_process_info_reply(self, data, addr, now):
@@ -182,6 +198,114 @@ class Client(object):
         self.server_db[reply_msg['id']]['_addr'] = addr
         return True
 
+    def client_start_request_prep_conf(self):
+        d = dict()
+        streams = []
+        port = int(self.conf['start_port'])
+        for i, stream in enumerate(self.conf['streams']):
+            entry = dict()
+            entry['port'] = str(port)
+            entry['stream'] = str(i)
+            port += 1
+            streams.append(entry)
+        d['streams'] = streams
+        return d
+
+    def create_measurment_start_msg(self):
+        msg = dict()
+        msg['id'] = maparo_id()
+        msg['seq'] = 0
+        msg['measurement'] = dict()
+        msg['measurement']['name'] = MODULE_UDP_PULSER_NAME
+        msg['measurement']['type'] = 'module'
+        msg['measurement']['configuration'] = self.client_start_request_prep_conf()
+        #pprint.pprint(msg)
+        json_bytes = str.encode(json.dumps(msg))
+        b = struct.pack('>II', PROTOCOL_MEASUREMENT_START_REQUEST_CODE, len(json_bytes))
+        return b + json_bytes
+
+    def tx_measurment_start(self):
+        msg = self.create_measurment_start_msg()
+        print('send measurement start request to {}'.format(self.dst_addr))
+        self.ctrl_sock.sendto(msg, self.dst_addr)
+
+    async def ctrl_measurement_start_timeout(self, seconds):
+        await asyncio.sleep(seconds)
+        print('server did not respone within {} seconds, retry again now'.format(seconds))
+        asyncio.ensure_future(self.measurment_start())
+
+    async def measurment_start(self):
+        print("process MEASURMENT START")
+        self.state = Client.STATES.MEASUREMENT_START
+        # send measurment start request messages until a
+        # a measurement start reply is received.
+        self.tx_measurment_start()
+        self.task_measurement_start_timeout = asyncio.ensure_future(
+                self.ctrl_measurement_start_timeout(CTRL_MEASUREMENT_START_TIMEOUT))
+
+    def ctrl_process_measurement_start_reply(self, data, addr, now):
+        # first of all, cancel the timer if one was
+        # registered
+        assert self.task_measurement_start_timeout != None
+        self.task_measurement_start_timeout.cancel()
+        if len(data) <= 8:
+            raise Exception('message to short, should header and at least one byte')
+        code, length = struct.unpack('>II', data[0:8])
+        assert len(data) == length + 8
+        print('receive valid measurment start reply message')
+        json_bytes = data[8:length + 8]
+        reply_msg = json.loads(json_bytes.decode())
+        if reply_msg['status'] == 'ok':
+            print('server returned ok, start measurement now')
+        else:
+            print('server problem with measurement start, cancel now')
+            return False
+        return True
+
+    def measurement_tx(self, i):
+        print_data = dict()
+        addr = self.conf['destination_addr']
+        port = self.conf['start_port'] + int(i)
+        #msg, seq_no = message(ctx, d, i)
+        self.measurement_v4_fd.sendto(bytearray(10), (addr, port))
+        #print_data['tx-time'] = high_res_timestamp()
+        #print_data['stream'] = stream_name
+        #print_data['seq-no'] = seq_no
+        #print_data['payload-size'] = len(msg)
+        #print_tx(print_data)
+
+    async def measurement_burst_mode(self, i, stream):
+        no_packets = stream['bursts-packets']
+        for packet_counter in range(0, no_packets):
+            self.measurement_tx(i)
+            if packet_counter == no_packets - 1:
+                # after the last transmission we do not wait
+                return
+            await asyncio.sleep(stream['burst-intra-time'])
+
+    async def measurement_tx_thread(self, i, stream):
+        if 'initial-waittime' in stream:
+            await asyncio.sleep(float(stream['initial-waittime']))
+        while True:
+            await self.measurement_burst_mode(i, stream)
+            await asyncio.sleep(stream['burst-inter-time'])
+
+    def init_v4_tx_fd(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return s
+
+    def init_v6_tx_fd(self):
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return s
+
+    def start_measurement(self):
+        self.state = Client.STATES.MEASUREMENT
+        self.measurement_v4_fd = self.init_v4_tx_fd()
+        self.measurement_v6_fd = self.init_v6_tx_fd()
+        for i, stream in enumerate(self.conf['streams']):
+            asyncio.ensure_future(self.measurement_tx_thread(i, stream))
 
     def ctrl_multiplex_msg(self, data, addr, now):
         if len(data) <= 4:
@@ -201,6 +325,15 @@ class Client(object):
                     return
             else:
                 print('error, receive rtt but not in state rtt processing')
+        elif code == PROTOCOL_MEASUREMENT_START_REPLY_CODE:
+            if self.state == Client.STATES.MEASUREMENT_START:
+                ok = self.ctrl_process_measurement_start_reply(data, addr, now)
+                if not ok:
+                    self.finish()
+                    return
+                self.start_measurement()
+            else:
+                print('error, receive measurment start but not in current state')
         else:
             print('receive unknown message [type: {}]'.format(code))
 
@@ -250,7 +383,6 @@ class Client(object):
     async def tx_msg_rtt(self, seq):
         msg, meta = self.msg_create_rtt_request(seq)
         self.ctrl_sock.sendto(msg, self.dst_addr)
-        #self.ctrl_sock.sendto(msg, self.ctrl_addr)
         self.state = Client.STATES.RTT
         self.state_ctx = meta
         # ok, wait maximum 3 seconds for reply messages
@@ -266,6 +398,7 @@ class Client(object):
         return b + json_bytes, msg
 
     async def ctrl_info_timeout(self):
+        print('wait {} seconds for info reply messages'.format(CTRL_INFO_TIMEOUT))
         await asyncio.sleep(CTRL_INFO_TIMEOUT)
         print('info timeout reached, now process all received info replies')
         maparo_servers = len(self.server_db)
@@ -280,6 +413,7 @@ class Client(object):
             print("ID: {}".format(v['id']))
             print("Arch: {}".format(v['arch']))
             print("OS: {}".format(v['os']))
+            print("Banner: {}".format(v['banner']))
             print("Address: {}".format(v['_addr']))
             self.dst_addr = v['_addr']
             asyncio.ensure_future(self.tx_msg_rtt(self.rtt_round))
@@ -292,10 +426,13 @@ class Client(object):
         self.ctrl_sock.sendto(msg, self.ctrl_addr)
         self.state = Client.STATES.INFO
 
+    def print_pre_info(self):
+        print('control address: {}'.format(self.args.ctrl_addr))
+        print('data address: {}'.format(self.args.addr))
+
     def run(self):
+        self.print_pre_info()
         self.init_ctrl()
-        #asyncio.ensure_future(self.tx_msg_rtt(self.rtt_round))
-        #asyncio.ensure_future(self.tx_msg_info())
         for i in range(self.info_round_max):
             asyncio.ensure_future(self.tx_msg_info(self.info_round))
             self.info_round += 1
@@ -309,9 +446,8 @@ class Client(object):
 
 class Server(object):
 
-    def __init__(self, args, conf):
+    def __init__(self, args):
         self.args = args
-        self.conf = conf
         self.info_seq = 0
         self.loop = asyncio.get_event_loop()
 
@@ -382,6 +518,7 @@ class Server(object):
         msg['seq-rp'] = msg['seq']
         msg['arch'] = 'unknown'
         msg['os'] = 'unknown'
+        msg['banner'] = "{}/{}".format(os.path.basename(__file__), sys.version)
         msg['modules'] = { MODULE_UDP_PULSER_NAME : {} }
         json_bytes = str.encode(json.dumps(msg))
         b = struct.pack('>II', PROTOCOL_INFO_REPLY_CODE, len(json_bytes))
@@ -402,6 +539,76 @@ class Server(object):
         reply_msg = self.ctrl_create_info_reply(reqest_msg)
         fd.sendto(reply_msg, addr)
 
+    def init_v4_rx_fd(self, port):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        s.setblocking(False)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(s, "SO_REUSEPORT"):
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        s.bind(('', int(port)))
+        return s
+
+    def handle_pulses(self, port, now, msg):
+        print('handle pulse')
+
+    def srv_cb_v4_rx(self, fd, port):
+        try:
+            msg, addr = fd.recvfrom(16600)
+            now = maparo_date()
+        except socket.error as e:
+            print('Expection')
+        self.handle_pulses(port, now, msg)
+
+    def srv_msg_start_request_process(self, request_data):
+        module_name = request_data['measurement']['name']
+        assert request_data['measurement']['type'] == 'module'
+        if module_name != MODULE_UDP_PULSER_NAME:
+            return False, 'module ({}) not supported'.format(module_name)
+        self.db_srv = dict()
+        for entry in request_data['measurement']['configuration']['streams']:
+            port = entry['port']
+            self.db_srv[port] = dict()
+            self.db_srv[port]['name'] = entry['stream']
+            self.db_srv[port]['fd'] = self.init_v4_rx_fd(port)
+            self.db_srv[port]['sequence-expected'] = 0
+            self.db_srv[port]['packets-reqeived'] = 0
+            self.db_srv[port]['bytes-received'] = 0
+            fd = self.db_srv[port]['fd']
+            self.loop.add_reader(fd, functools.partial(self.srv_cb_v4_rx, fd, port))
+        return True, ""
+
+    def ctrl_process_measurement_start_request_pkt(self, data):
+        json_len = struct.unpack('>I', data[4:8])[0]
+        if len(data) - (4 + 4) < json_len:
+            return False, None
+        json_bytes = data[8:json_len + 8]
+        msg = json.loads(json_bytes.decode())
+        return True, msg
+
+    def ctrl_create_measurement_start_request_reply(self, msg_request, ok, err_msg):
+        msg = dict()
+        msg['id'] = maparo_id()
+        msg['seq'] = self.info_seq; self.info_seq += 1
+        msg['seq-rp'] = msg_request['seq']
+        if not ok:
+            # return with failure
+            msg['status'] = 'failed'
+            msg['message'] = err_msg
+        else:
+            # return with success
+            msg['status'] = 'ok'
+        json_bytes = str.encode(json.dumps(msg))
+        b = struct.pack('>II', PROTOCOL_MEASUREMENT_START_REPLY_CODE, len(json_bytes))
+        return b + json_bytes
+
+    def ctrl_process_measurement_start_request(self, fd, data, addr):
+        ok, reqest_msg = self.ctrl_process_measurement_start_request_pkt(data)
+        if not ok:
+            return
+        ok, msg = self.srv_msg_start_request_process(reqest_msg)
+        reply_msg = self.ctrl_create_measurement_start_request_reply(reqest_msg, ok, msg)
+        fd.sendto(reply_msg, addr)
+
     def ctrl_multiplex(self, name, fd):
         try:
             data, addr = fd.recvfrom(CTRL_DGRAM_BUF_SIZE)
@@ -415,6 +622,8 @@ class Server(object):
             self.ctrl_process_rtt_request(fd, data, addr)
         elif code == PROTOCOL_INFO_REQUEST_CODE:
             self.ctrl_process_info_request(fd, data, addr)
+        elif code == PROTOCOL_MEASUREMENT_START_REQUEST_CODE:
+            self.ctrl_process_measurement_start_request(fd, data, addr)
         else:
             print('unknown message type: {}'.format(code))
         #fd.sendto(bytearray(11), addr)
@@ -480,9 +689,9 @@ def main():
     print('maparo-pulser©')
     is_server, args, conf = init_ctx()
     if is_server:
-        handle = Server(args, conf)
+        handle = Server(args)
     else:
-        handle = Client(args)
+        handle = Client(args, conf)
     handle.run()
 
 if __name__ == '__main__':
