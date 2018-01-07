@@ -15,6 +15,9 @@ import ipaddress
 import enum
 import os
 import logging
+import lzma
+import binascii
+import base64
 
 CTRL_MCAST_ADDR_V4 = '224.0.0.1'
 CTRL_MCAST_ADDR_V6 = 'FF02::1'
@@ -206,10 +209,11 @@ class Client(object):
         for i, stream in enumerate(self.conf['streams']):
             entry = dict()
             entry['port'] = str(port)
-            entry['stream'] = str(i)
+            #entry['stream'] = str(i)
             port += 1
             streams.append(entry)
         d['streams'] = streams
+        d['snaplen'] = '8'
         return d
 
     def create_measurment_start_msg(self):
@@ -451,6 +455,7 @@ class Server(object):
         self.args = args
         self.info_seq = 0
         self.loop = asyncio.get_event_loop()
+        self.session = None
 
     def run(self):
         self.init_ctrl_channels()
@@ -549,8 +554,35 @@ class Server(object):
         s.bind(('', int(port)))
         return s
 
+    c = 0
+
     def handle_pulses(self, port, now, msg):
-        warn('handle pulse')
+        pkt_data = struct.unpack('!II', msg[0:8])
+        seq, stream_id = pkt_data[0], pkt_data[1]
+        e = dict()
+        e['port'] = port
+        e['time'] = now
+        #e['id'] = stream_id
+        #e['msg-stream-id'] = stream_id
+        #e['msg-seq'] = seq
+
+        # we encode the data into base 64, which is allowed
+        # by json and a litte bit smaller as a simple hexlify
+        e['d'] = base64.b64encode(msg[0:self.session['snaplen']]).decode()
+        #e['d'] = binascii.hexlify(msg[0:8]).decode()
+
+        self.session['receptions'].append(e)
+
+        #print(Server.c)
+        #Server.c += 1
+        #l = len(str.encode(json.dumps(self.session['receptions'])))
+        #warn(l)
+        #lz = len(lzma.compress(str.encode(json.dumps(self.session['receptions']))))
+        #warn(lz)
+        #print('')
+
+
+
 
     def srv_cb_v4_rx(self, fd, port):
         try:
@@ -559,6 +591,13 @@ class Server(object):
         except socket.error as e:
             warn('Expection')
         self.handle_pulses(port, now, msg)
+
+    def session_init(self, client_id, snaplen):
+        assert self.session == None
+        self.session = dict()
+        self.session['client-id'] = client_id
+        self.session['snaplen'] = int(snaplen)
+        self.session['receptions'] = list()
 
     def srv_msg_start_request_process(self, request_data):
         module_name = request_data['measurement']['name']
@@ -569,13 +608,11 @@ class Server(object):
         for entry in request_data['measurement']['configuration']['streams']:
             port = entry['port']
             self.db_srv[port] = dict()
-            self.db_srv[port]['name'] = entry['stream']
             self.db_srv[port]['fd'] = self.init_v4_rx_fd(port)
-            self.db_srv[port]['sequence-expected'] = 0
-            self.db_srv[port]['packets-reqeived'] = 0
-            self.db_srv[port]['bytes-received'] = 0
             fd = self.db_srv[port]['fd']
             self.loop.add_reader(fd, functools.partial(self.srv_cb_v4_rx, fd, port))
+        snaplen = request_data['measurement']['configuration']['snaplen']
+        self.session_init(request_data['id'], snaplen)
         return True, ""
 
     def ctrl_process_measurement_start_request_pkt(self, data):
