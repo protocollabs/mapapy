@@ -14,6 +14,7 @@ import time
 import ipaddress
 import enum
 import os
+import logging
 
 CTRL_MCAST_ADDR_V4 = '224.0.0.1'
 CTRL_MCAST_ADDR_V6 = 'FF02::1'
@@ -129,18 +130,18 @@ class Client(object):
 
     def ctrl_process_rtt_reply_check(self, reply_data):
         if reply_data['seq-rp'] != self.state_ctx['seq']:
-            print('sequence number not identical')
+            warn('sequence number not identical')
             return False
         return True
 
     def ctrl_process_rtt_reply_check_time_sync(self, reply_data, now):
         request_date = maparo_date_parse(reply_data['ts-rp'])
         rtt = now - request_date
-        print("rtt: {}".format(human_timedelta(rtt)))
+        warn("rtt: {}".format(human_timedelta(rtt)))
         time_server = maparo_date_parse(reply_data['ts'])
         ideal_time_server = request_date - (time_server - (rtt / 2.0))
-        print("time delta to server: {}".format(human_timedelta(ideal_time_server)))
-        print("[Note: smaller 0: server clock is before client clock, otherwise behind]")
+        warn("time delta to server: {}".format(human_timedelta(ideal_time_server)))
+        warn("[Note: smaller 0: server clock is before client clock, otherwise behind]")
         self.rtt_db.append((rtt, ideal_time_server))
 
     def ctrl_process_rtt_reply(self, data, addr, now):
@@ -152,10 +153,10 @@ class Client(object):
             raise Exception('message to short, should header and at least one byte')
         code, length = struct.unpack('>II', data[0:8])
         if code != PROTOCOL_RTT_REPLY_CODE:
-            print('receive invalid rtt reply message')
+            warn('receive invalid rtt reply message')
             return False
         assert len(data) == length + 8
-        print('receive valid rtt reply message')
+        warn('receive valid rtt reply message')
         json_bytes = data[8:length + 8]
         reply_msg = json.loads(json_bytes.decode())
         ok = self.ctrl_process_rtt_reply_check(reply_msg)
@@ -176,12 +177,12 @@ class Client(object):
                     min_diff_abs = abs(i[1])
                     min_diff = i[1]
             if self.time_diff:
-                print("Your time difference: {} ms".format(self.time_diff))
-                print(' measuremtn time difference {}'.format(human_timedelta(min_diff)))
-                print(' But will take the given time as difference calculation!')
+                warn("Your time difference: {} ms".format(self.time_diff))
+                warn(' measuremtn time difference {}'.format(human_timedelta(min_diff)))
+                warn(' But will take the given time as difference calculation!')
             else:
                 self.time_diff = timedelta_ms(min_diff)
-                print("Calculated time difference: {} ms".format(self.time_diff))
+                warn("Calculated time difference: {} ms".format(self.time_diff))
             # ok, last round, now switch to next mode
             asyncio.ensure_future(self.measurment_start())
         return True
@@ -191,7 +192,7 @@ class Client(object):
             raise Exception('message to short, should header and at least one byte')
         _, length = struct.unpack('>II', data[0:8])
         assert len(data) == length + 8
-        print('receive valid info reply message')
+        warn('receive valid info reply message')
         json_bytes = data[8:length + 8]
         reply_msg = json.loads(json_bytes.decode())
         self.server_db[reply_msg['id']] = reply_msg
@@ -226,16 +227,16 @@ class Client(object):
 
     def tx_measurment_start(self):
         msg = self.create_measurment_start_msg()
-        print('send measurement start request to {}'.format(self.dst_addr))
+        warn('send measurement start request to {}'.format(self.dst_addr))
         self.ctrl_sock.sendto(msg, self.dst_addr)
 
     async def ctrl_measurement_start_timeout(self, seconds):
         await asyncio.sleep(seconds)
-        print('server did not respone within {} seconds, retry again now'.format(seconds))
+        warn('server did not respone within {} seconds, retry again now'.format(seconds))
         asyncio.ensure_future(self.measurment_start())
 
     async def measurment_start(self):
-        print("process MEASURMENT START")
+        warn("process MEASURMENT START")
         self.state = Client.STATES.MEASUREMENT_START
         # send measurment start request messages until a
         # a measurement start reply is received.
@@ -252,13 +253,13 @@ class Client(object):
             raise Exception('message to short, should header and at least one byte')
         code, length = struct.unpack('>II', data[0:8])
         assert len(data) == length + 8
-        print('receive valid measurment start reply message')
+        warn('receive valid measurment start reply message')
         json_bytes = data[8:length + 8]
         reply_msg = json.loads(json_bytes.decode())
         if reply_msg['status'] == 'ok':
-            print('server returned ok, start measurement now')
+            warn('server returned ok, start measurement now')
         else:
-            print('server problem with measurement start, cancel now')
+            warn('server problem with measurement start, cancel now')
             return False
         return True
 
@@ -317,14 +318,14 @@ class Client(object):
                 if not ok:
                     return
             else:
-                print('error, receive rtt but not in state rtt processing')
+                warn('error, receive rtt but not in state rtt processing')
         elif code == PROTOCOL_INFO_REPLY_CODE:
             if self.state == Client.STATES.INFO:
                 ok = self.ctrl_process_info_reply(data, addr, now)
                 if not ok:
                     return
             else:
-                print('error, receive rtt but not in state rtt processing')
+                warn('error, receive rtt but not in state rtt processing')
         elif code == PROTOCOL_MEASUREMENT_START_REPLY_CODE:
             if self.state == Client.STATES.MEASUREMENT_START:
                 ok = self.ctrl_process_measurement_start_reply(data, addr, now)
@@ -333,9 +334,9 @@ class Client(object):
                     return
                 self.start_measurement()
             else:
-                print('error, receive measurment start but not in current state')
+                warn('error, receive measurment start but not in current state')
         else:
-            print('receive unknown message [type: {}]'.format(code))
+            warn('receive unknown message [type: {}]'.format(code))
 
 
     def ctrl_multiplex(self, fd):
@@ -377,7 +378,7 @@ class Client(object):
 
     async def ctrl_rtt_timeout(self, seconds):
         await asyncio.sleep(seconds)
-        print('server did not respone within {} seconds, retry again now'.format(seconds))
+        warn('server did not respone within {} seconds, retry again now'.format(seconds))
         asyncio.ensure_future(self.tx_msg_rtt(self.rtt_round))
 
     async def tx_msg_rtt(self, seq):
@@ -398,27 +399,27 @@ class Client(object):
         return b + json_bytes, msg
 
     async def ctrl_info_timeout(self):
-        print('wait {} seconds for info reply messages'.format(CTRL_INFO_TIMEOUT))
+        warn('wait {} seconds for info reply messages'.format(CTRL_INFO_TIMEOUT))
         await asyncio.sleep(CTRL_INFO_TIMEOUT)
-        print('info timeout reached, now process all received info replies')
+        warn('info timeout reached, now process all received info replies')
         maparo_servers = len(self.server_db)
         if maparo_servers > 1:
-            print('{} maparo servers discovered'.format(maparo_servers))
+            warn('{} maparo servers discovered'.format(maparo_servers))
             for k, v in self.server_db.items():
-                print(k)
+                warn(k)
         elif maparo_servers == 1:
             k = list(self.server_db.keys())[0]
             v = self.server_db[k]
-            print('exactly one maparo server discovered - great')
-            print("ID: {}".format(v['id']))
-            print("Arch: {}".format(v['arch']))
-            print("OS: {}".format(v['os']))
-            print("Banner: {}".format(v['banner']))
-            print("Address: {}".format(v['_addr']))
+            warn('exactly one maparo server discovered - great')
+            warn("ID: {}".format(v['id']))
+            warn("Arch: {}".format(v['arch']))
+            warn("OS: {}".format(v['os']))
+            warn("Banner: {}".format(v['banner']))
+            warn("Address: {}".format(v['_addr']))
             self.dst_addr = v['_addr']
             asyncio.ensure_future(self.tx_msg_rtt(self.rtt_round))
         else:
-            print('no maparo server discovered, giving up')
+            warn('no maparo server discovered, giving up')
             self.finish()
 
     async def tx_msg_info(self, info_round):
@@ -427,8 +428,8 @@ class Client(object):
         self.state = Client.STATES.INFO
 
     def print_pre_info(self):
-        print('control address: {}'.format(self.args.ctrl_addr))
-        print('data address: {}'.format(self.args.addr))
+        warn('control address: {}'.format(self.args.ctrl_addr))
+        warn('data address: {}'.format(self.args.addr))
 
     def run(self):
         self.print_pre_info()
@@ -549,14 +550,14 @@ class Server(object):
         return s
 
     def handle_pulses(self, port, now, msg):
-        print('handle pulse')
+        warn('handle pulse')
 
     def srv_cb_v4_rx(self, fd, port):
         try:
             msg, addr = fd.recvfrom(16600)
             now = maparo_date()
         except socket.error as e:
-            print('Expection')
+            warn('Expection')
         self.handle_pulses(port, now, msg)
 
     def srv_msg_start_request_process(self, request_data):
@@ -615,7 +616,7 @@ class Server(object):
         except:
             raise
         if len(data) <= 4:
-            print('message to short, should header and at least one byte')
+            warn('message to short, should header and at least one byte')
             return
         code = struct.unpack('>I', data[0:4])[0]
         if code == PROTOCOL_RTT_REQUEST_CODE:
@@ -625,9 +626,9 @@ class Server(object):
         elif code == PROTOCOL_MEASUREMENT_START_REQUEST_CODE:
             self.ctrl_process_measurement_start_request(fd, data, addr)
         else:
-            print('unknown message type: {}'.format(code))
+            warn('unknown message type: {}'.format(code))
         #fd.sendto(bytearray(11), addr)
-        #print(len(data))
+        #warn(len(data))
 
     def init_ctrl_channels(self):
         """ open a unicast and multicast udp server socket """
@@ -672,7 +673,7 @@ def parse_args():
 
 def load_configuration_file(args):
     if not args.configuration:
-        print("client mode but no --configuration <file> given ...")
+        warn("client mode but no --configuration <file> given ...")
         sys.exit(0)
     config = dict()
     exec(open(args.configuration).read(), None, config)
@@ -685,9 +686,24 @@ def init_ctx():
         return False, args, conf
     return True, args, None
 
+def warn(msg):
+    logging.warning(msg)
+
+def info(msg):
+    logging.info(msg)
+
+def debug(msg):
+    logging.debug(msg)
+
+def init_logging(args):
+    levels = [logging.WARNING, logging.INFO, logging.DEBUG]
+    level = levels[min(len(levels) - 1, args.verbose)]
+    logging.basicConfig(level=level, format="%(message)s")
+
 def main():
-    print('maparo-pulser©')
     is_server, args, conf = init_ctx()
+    init_logging(args)
+    warn('maparo-pulser©')
     if is_server:
         handle = Server(args)
     else:
