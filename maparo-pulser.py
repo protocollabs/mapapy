@@ -695,32 +695,14 @@ class Server(object):
         s.bind(('', int(port)))
         return s
 
-    c = 0
-
     def handle_pulses(self, port, now, msg):
-        pkt_data = struct.unpack('!II', msg[0:8])
-        seq, stream_id = pkt_data[0], pkt_data[1]
         e = dict()
         e['port'] = port
         e['time'] = now
-        #e['id'] = stream_id
-        #e['msg-stream-id'] = stream_id
-        #e['msg-seq'] = seq
-
         # we encode the data into base 64, which is allowed
         # by json and a litte bit smaller as a simple hexlify
         e['d'] = base64.b64encode(msg[0:self.session['snaplen']]).decode()
-        #e['d'] = binascii.hexlify(msg[0:8]).decode()
-
         self.session['receptions'].append(e)
-
-        #print(Server.c)
-        #Server.c += 1
-        #l = len(str.encode(json.dumps(self.session['receptions'])))
-        #warn(l)
-        #lz = len(lzma.compress(str.encode(json.dumps(self.session['receptions']))))
-        #warn(lz)
-        #print('')
 
     def srv_cb_v4_rx(self, fd, port):
         try:
