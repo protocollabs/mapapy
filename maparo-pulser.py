@@ -269,8 +269,36 @@ class Client(object):
             return False
         return True
 
+    def prepare_analysis_data_server_decompress(self, data):
+        data = base64.b64decode(data)
+        uncompressed = lzma.decompress(data).decode("utf-8")
+        return json.loads(uncompressed)
+
+    def sanitze_entry(self, entry):
+        header = base64.b64decode(entry['d'])
+        seq_no, stream = struct.unpack('>II', header)
+        d = dict()
+        d['rx-time'] = entry['time']
+        d['rx-port'] = entry['port']
+        d['seq-no'] = seq_no
+        d['stream'] = stream
+        return d
+
     def prepare_analysis_data_server(self, msg_stop):
-        pass
+        if 'compression' in msg_stop['measurement'] and \
+                msg_stop['measurement']['compression'] == 'lzma':
+            data = self.prepare_analysis_data_server_decompress(msg_stop['measurement']['data'])
+        else:
+            data = msg_stop['measurement']['data']
+
+        d = dict()
+        d['stream'] = dict()
+        for i, stream in enumerate(self.conf['streams']):
+            d['stream'][i] = list()
+        for entry in data:
+            ee = self.sanitze_entry(entry)
+            d['stream'][ee['stream']].append(ee)
+        return d
 
     def prepare_analysis_data_client(self):
         d = dict()
@@ -282,7 +310,7 @@ class Client(object):
         return d
 
     def prepare_analysis_data(self, msg_stop):
-        data_server =  None #self.prepare_analysis_data_server(msg_stop)
+        data_server =  self.prepare_analysis_data_server(msg_stop)
         data_client = self.prepare_analysis_data_client()
         d = dict()
         d['header'] = dict()
