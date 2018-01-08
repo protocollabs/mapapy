@@ -95,7 +95,7 @@ def maparo_date_parse(string):
 
 class Client(object):
 
-    STATES = enum.Enum('States', 'RTT INFO MEASUREMENT_START MEASUREMENT MEASURMENT_STOP')
+    STATES = enum.Enum('States', 'RTT INFO MEASUREMENT_START MEASUREMENT MEASUREMENT_STOP')
 
     def __init__(self, args, conf):
         self.args = args
@@ -111,6 +111,9 @@ class Client(object):
         self.task_rtt_timeout = None
         self.server_db = dict()
         self.dst_addr = None
+        self.measurement_duration_timeout = None
+        self.tasks_measurement_tx = list()
+        self.task_measurement_stop = None
 
     def init_ctrl_mcast(self, addr):
         if addr.version == 4:
@@ -224,7 +227,6 @@ class Client(object):
         msg['measurement']['name'] = MODULE_UDP_PULSER_NAME
         msg['measurement']['type'] = 'module'
         msg['measurement']['configuration'] = self.client_start_request_prep_conf()
-        #pprint.pprint(msg)
         json_bytes = str.encode(json.dumps(msg))
         b = struct.pack('>II', PROTOCOL_MEASUREMENT_START_REQUEST_CODE, len(json_bytes))
         return b + json_bytes
@@ -240,7 +242,7 @@ class Client(object):
         asyncio.ensure_future(self.measurment_start())
 
     async def measurment_start(self):
-        warn("process MEASURMENT START")
+        warn("process MEASUREMENT START")
         self.state = Client.STATES.MEASUREMENT_START
         # send measurment start request messages until a
         # a measurement start reply is received.
@@ -267,22 +269,125 @@ class Client(object):
             return False
         return True
 
-    def measurement_tx(self, i):
-        print_data = dict()
+    def prepare_analysis_data_server(self, msg_stop):
+        pass
+
+    def prepare_analysis_data_client(self):
+        d = dict()
+        d['stream'] = dict()
+        for i, stream in enumerate(self.conf['streams']):
+            d['stream'][i] = list()
+            for packet in self.db_tx[i]:
+                d['stream'][i].append(packet)
+        return d
+
+    def prepare_analysis_data(self, msg_stop):
+        data_server =  None #self.prepare_analysis_data_server(msg_stop)
+        data_client = self.prepare_analysis_data_client()
+        d = dict()
+        d['header'] = dict()
+        d['header']['module'] = MODULE_UDP_PULSER_NAME
+        d['header']['time-diff'] = 999.99
+        d['template'] = self.conf
+        d['client'] = data_client
+        d['server'] = data_server
+        return d
+
+    async def measurment_finish(self, reply_msg):
+        await self.kill_measurment_tx_tasks()
+        data = self.prepare_analysis_data(reply_msg)
+        data_json = json.dumps(data, indent=2, sort_keys=True)
+        print(data_json)
+        self.loop.stop()
+
+    def ctrl_process_measurement_stop_reply(self, data, addr, now):
+        assert self.task_measurement_stop != None
+        self.task_measurement_stop.cancel()
+        if len(data) <= 8:
+            raise Exception('message to short, should header and at least one byte')
+        code, length = struct.unpack('>II', data[0:8])
+        assert len(data) == length + 8
+        warn('receive valid measurment stop reply message')
+        json_bytes = data[8:length + 8]
+        reply_msg = json.loads(json_bytes.decode())
+        asyncio.ensure_future(self.measurment_finish(reply_msg))
+        return True
+
+    async def measurement_finish_timeout(self, seconds):
+        await asyncio.sleep(seconds)
+        warn('server did not respone within {} seconds, retry again now'.format(seconds))
+        asyncio.ensure_future(self.measurement_finish())
+
+    def msg_create_measurement_stop_request(self):
+        msg = dict()
+        msg['id'] = maparo_id()
+        msg['seq'] = '0'
+        json_bytes = str.encode(json.dumps(msg))
+        b = struct.pack('>II', PROTOCOL_MEASUREMENT_STOP_REQUEST_CODE, len(json_bytes))
+        return b + json_bytes
+
+    async def measurement_finish(self):
+        assert self.state == Client.STATES.MEASUREMENT
+        msg = self.msg_create_measurement_stop_request()
+        self.ctrl_sock.sendto(msg, self.dst_addr)
+        self.state = Client.STATES.MEASUREMENT_STOP
+        # ok, wait maximum 3 seconds for reply messages
+        self.task_measurement_stop = asyncio.ensure_future(self.measurement_finish_timeout(3))
+
+    async def kill_measurment_tx_tasks(self):
+        for task in self.tasks_measurement_tx:
+            task.cancel()
+        self.tasks_measurement_tx = list()
+
+    async def measurement_duration_timer(self, duration):
+        await asyncio.sleep(duration)
+        warn('timeout reached after {} seconds, finish measurement'.format(duration))
+        self.measurement_duration_timeout = None
+        await self.kill_measurment_tx_tasks()
+        asyncio.ensure_future(self.measurement_finish())
+
+    def start_measruement_duration_timer(self):
+        duration = self.conf['duration']
+        self.measurement_duration_timeout = asyncio.ensure_future(
+                self.measurement_duration_timer(duration))
+
+    def gen_pulse_packet(self, i, stream):
+        seq_no = 0
+        if len(self.db_tx[i]) != 0:
+            seq_no = self.db_tx[i][-1]['seq-no'] + 1
+
+        # first packet
+        hdr = struct.pack('!II', seq_no, i)
+        payload_size = stream['payload-size']
+        assert payload_size >= 8
+        msg = hdr + bytes([0x00 for _ in range(payload_size)])
+        return msg, seq_no
+
+
+    def measurement_tx(self, i, stream):
         addr = self.conf['destination_addr']
         port = self.conf['start_port'] + int(i)
-        #msg, seq_no = message(ctx, d, i)
-        self.measurement_v4_fd.sendto(bytearray(10), (addr, port))
-        #print_data['tx-time'] = high_res_timestamp()
-        #print_data['stream'] = stream_name
-        #print_data['seq-no'] = seq_no
-        #print_data['payload-size'] = len(msg)
-        #print_tx(print_data)
+        msg, seq_no = self.gen_pulse_packet(i, stream)
+        self.measurement_v4_fd.sendto(msg, (addr, port))
+
+        record_data = dict()
+        record_data['tx-time'] = maparo_date()
+        record_data['stream'] = i
+        record_data['seq-no'] = seq_no
+        record_data['payload-size'] = stream['payload-size']
+
+        warn(record_data)
+
+        self.db_tx[i].append(record_data)
+
+        if self.measurement_duration_timeout == None:
+            # start timer for now
+            self.start_measruement_duration_timer()
 
     async def measurement_burst_mode(self, i, stream):
         no_packets = stream['bursts-packets']
         for packet_counter in range(0, no_packets):
-            self.measurement_tx(i)
+            self.measurement_tx(i, stream)
             if packet_counter == no_packets - 1:
                 # after the last transmission we do not wait
                 return
@@ -309,8 +414,11 @@ class Client(object):
         self.state = Client.STATES.MEASUREMENT
         self.measurement_v4_fd = self.init_v4_tx_fd()
         self.measurement_v6_fd = self.init_v6_tx_fd()
+        self.db_tx = dict()
         for i, stream in enumerate(self.conf['streams']):
-            asyncio.ensure_future(self.measurement_tx_thread(i, stream))
+            self.db_tx[i] = list()
+            t = asyncio.ensure_future(self.measurement_tx_thread(i, stream))
+            self.tasks_measurement_tx.append(t)
 
     def ctrl_multiplex_msg(self, data, addr, now):
         if len(data) <= 4:
@@ -339,6 +447,11 @@ class Client(object):
                 self.start_measurement()
             else:
                 warn('error, receive measurment start but not in current state')
+        elif code == PROTOCOL_MEASUREMENT_STOP_REPLY_CODE:
+            if self.state == Client.STATES.MEASUREMENT_STOP:
+                ok = self.ctrl_process_measurement_stop_reply(data, addr, now)
+            else:
+                warn('error, receive measurment stop reply but not in current state')
         else:
             warn('receive unknown message [type: {}]'.format(code))
 
@@ -581,9 +694,6 @@ class Server(object):
         #warn(lz)
         #print('')
 
-
-
-
     def srv_cb_v4_rx(self, fd, port):
         try:
             msg, addr = fd.recvfrom(16600)
@@ -591,6 +701,9 @@ class Server(object):
         except socket.error as e:
             warn('Expection')
         self.handle_pulses(port, now, msg)
+
+    def session_fini(self):
+        self.session = None
 
     def session_init(self, client_id, snaplen):
         assert self.session == None
@@ -647,6 +760,45 @@ class Server(object):
         reply_msg = self.ctrl_create_measurement_start_request_reply(reqest_msg, ok, msg)
         fd.sendto(reply_msg, addr)
 
+    def ctrl_process_measurement_stop_request_pkt(self, data):
+        json_len = struct.unpack('>I', data[4:8])[0]
+        if len(data) - (4 + 4) < json_len:
+            return False, None
+        json_bytes = data[8:json_len + 8]
+        msg = json.loads(json_bytes.decode())
+        return True, msg
+
+    def measurement_cleanup(self, request_data):
+        self.session_fini()
+
+    def stop_prepare_msg(self):
+        """ returns a compressed string of json list """
+        data =  self.session['receptions']
+        compressed_bytes = lzma.compress(str.encode(json.dumps(data)))
+        compressed_base64 = base64.b64encode(compressed_bytes)
+        return compressed_base64.decode("utf-8")
+
+    def ctrl_create_measurement_stop_request_reply(self, msg_request):
+        msg = dict()
+        msg['id'] = maparo_id()
+        msg['seq'] = 0 # FIXME
+        msg['seq-rp'] = msg_request['seq']
+        msg["measurement"] = dict()
+        msg["measurement"]['name'] = MODULE_UDP_PULSER_NAME
+        msg["measurement"]['compression'] = 'lzma'
+        msg["measurement"]['data'] = self.stop_prepare_msg()
+        json_bytes = str.encode(json.dumps(msg))
+        b = struct.pack('>II', PROTOCOL_MEASUREMENT_STOP_REPLY_CODE, len(json_bytes))
+        return b + json_bytes
+
+    def ctrl_process_measurement_stop_request(self, fd, data, addr):
+        ok, reqest_msg = self.ctrl_process_measurement_stop_request_pkt(data)
+        if not ok:
+            return
+        reply_msg = self.ctrl_create_measurement_stop_request_reply(reqest_msg)
+        fd.sendto(reply_msg, addr)
+        self.measurement_cleanup(reqest_msg)
+
     def ctrl_multiplex(self, name, fd):
         try:
             data, addr = fd.recvfrom(CTRL_DGRAM_BUF_SIZE)
@@ -662,6 +814,8 @@ class Server(object):
             self.ctrl_process_info_request(fd, data, addr)
         elif code == PROTOCOL_MEASUREMENT_START_REQUEST_CODE:
             self.ctrl_process_measurement_start_request(fd, data, addr)
+        elif code == PROTOCOL_MEASUREMENT_STOP_REQUEST_CODE:
+            self.ctrl_process_measurement_stop_request(fd, data, addr)
         else:
             warn('unknown message type: {}'.format(code))
         #fd.sendto(bytearray(11), addr)
