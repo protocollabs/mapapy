@@ -278,8 +278,8 @@ class Client(object):
         header = base64.b64decode(entry['d'])
         seq_no, stream = struct.unpack('>II', header)
         d = dict()
-        d['rx-time'] = entry['time']
-        d['rx-port'] = entry['port']
+        d['time'] = entry['time']
+        d['port'] = entry['port']
         d['seq-no'] = seq_no
         d['stream'] = stream
         return d
@@ -315,7 +315,8 @@ class Client(object):
         d = dict()
         d['header'] = dict()
         d['header']['module'] = MODULE_UDP_PULSER_NAME
-        d['header']['time-diff'] = 999.99
+        d['header']['time-diff'] = self.time_diff
+        d['header']['time-diff-unit'] = 'ms'
         d['template'] = self.conf
         d['client'] = data_client
         d['server'] = data_server
@@ -399,7 +400,7 @@ class Client(object):
         self.measurement_v4_fd.sendto(msg, (addr, port))
 
         record_data = dict()
-        record_data['tx-time'] = maparo_date()
+        record_data['time'] = maparo_date()
         record_data['stream'] = i
         record_data['seq-no'] = seq_no
         record_data['payload-size'] = stream['payload-size']
