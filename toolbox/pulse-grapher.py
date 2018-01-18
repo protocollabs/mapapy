@@ -163,7 +163,8 @@ def print_correlated(correlated):
             print("    client -> [{:.3f} ms] -> server".format(diff.total_seconds() * 1000.0))
 
 def offset(timedelta):
-    return timedelta.total_seconds() * 20.0
+    margin_top = 20
+    return timedelta.total_seconds() * 20.0 + margin_top
 
 def paint(data, stats):
     svg = SVG()
@@ -174,7 +175,7 @@ def paint(data, stats):
             entry = stream_data[seq_no]
             y1 = offset(entry['client']['time'] - stats['time-min'])
             y2 = offset(entry['server']['time'] - stats['time-min'])
-            svg.line(20, y1, 200, y2)
+            svg.line(20, y1, 500, y2)
             #print("    client -> [{:.3f} ms] -> server".format(diff.total_seconds() * 1000.0))
     svg_path = 'drawing.svg'
     print("write SVG image to {}".format(svg_path))
