@@ -68,6 +68,21 @@ def correlate_data(data):
             db[stream_id][seq_no]['server'] = db_entry(stream_entry)
     return db
 
+def data_stats(data):
+    stats = dict()
+
+def normalize(data, raw_data):
+    """ normalize time by adding (possible negative) recorded delta to server time"""
+    time_diff_ms = raw_data['header']['time-diff']
+    time_diff = datetime.timedelta(milliseconds=time_diff_ms)
+    for stream_id, stream_data in data.items():
+        for seq_no in sorted(stream_data):
+            entry = stream_data[seq_no]
+            # make a copy of "original" time
+            entry['server']['time-unmodified'] = entry['server']['time']
+            entry['server']['time'] = entry['server']['time'] + time_diff
+
+
 def print_correlated(correlated):
     for stream_id, stream_data in correlated.items():
         print('Stream: {}'.format(stream_id))
@@ -80,7 +95,9 @@ def print_correlated(correlated):
 def process(data):
     check_data(data)
     correlated = correlate_data(data)
+    normalize(correlated, data)
     print_correlated(correlated)
+    stats = data_stats(correlated)
 
 def stdin_read():
     d = ''
