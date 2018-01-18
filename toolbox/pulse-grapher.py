@@ -176,7 +176,9 @@ def paint(data, stats):
             y2 = offset(entry['server']['time'] - stats['time-min'])
             svg.line(20, y1, 200, y2)
             #print("    client -> [{:.3f} ms] -> server".format(diff.total_seconds() * 1000.0))
-    svg.write()
+    svg_path = 'drawing.svg'
+    print("write SVG image to {}".format(svg_path))
+    svg.write(filepath=svg_path)
 
 def process(data):
     check_data(data)
