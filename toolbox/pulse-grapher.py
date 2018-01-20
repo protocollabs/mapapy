@@ -6,6 +6,7 @@ import datetime
 import json
 import pprint
 
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 from pylab import *
 import numpy as np
@@ -187,18 +188,36 @@ def paint(data, stats):
     svg.write(filepath=svg_path)
 
 def graph(data, stats):
-	x = np.linspace(0, 2*np.pi, 400)
-	y = np.sin(x**2)
+    fig = plt.figure()
+    subplots_adjust(hspace=0.000)
+    number_of_subplots = len(data.items())
 
-	subplots_adjust(hspace=0.000)
-	number_of_subplots=3
+    v = 1
+    for stream_id, stream_data in data.items():
+        x = list(); y = list()
+        for seq_no in sorted(stream_data):
+            entry = stream_data[seq_no]
 
-	for i,v in enumerate(range(number_of_subplots)):
-		v = v + 1
-		ax1 = subplot(number_of_subplots,1,v)
-		ax1.plot(x,y)
+            # packet from start measurement to start packet transmission
+            start_start_delta = entry['server']['time'] - stats['time-min']
+            start_start_delta_sec = start_start_delta.total_seconds()
+            x.append(start_start_delta_sec)
 
-	plt.show()
+            # packet duration
+            duration = entry['server']['time'] - entry['client']['time']
+            duration_sec = duration.total_seconds()
+            y.append(duration_sec)
+
+        ax1 = fig.add_subplot(number_of_subplots, 1, v)
+        #ax1.bar(x, y, width=0.05)
+        ax1.set_ylim(0, stats['duration-max'].total_seconds())
+        ax1.plot(x, y)
+        ax1.scatter(x, y, color='blue')
+        v += 1
+
+    svg_path = 'chart.png'
+    print("write SVG image to {}".format(svg_path))
+    fig.savefig(svg_path, bbox_inches='tight')
 
 def process(data):
     check_data(data)
