@@ -6,6 +6,11 @@ import datetime
 import json
 import pprint
 
+import matplotlib.pyplot as plt
+from pylab import *
+import numpy as np
+
+
 class SVG:
     def __init__(self):
         self.d = '<svg xmlns="http://www.w3.org/2000/svg">'
@@ -181,6 +186,20 @@ def paint(data, stats):
     print("write SVG image to {}".format(svg_path))
     svg.write(filepath=svg_path)
 
+def graph(data, stats):
+	x = np.linspace(0, 2*np.pi, 400)
+	y = np.sin(x**2)
+
+	subplots_adjust(hspace=0.000)
+	number_of_subplots=3
+
+	for i,v in enumerate(range(number_of_subplots)):
+		v = v + 1
+		ax1 = subplot(number_of_subplots,1,v)
+		ax1.plot(x,y)
+
+	plt.show()
+
 def process(data):
     check_data(data)
     correlated = correlate(data)
@@ -188,6 +207,7 @@ def process(data):
     #print_correlated(correlated)
     stats = statistics(correlated)
     paint(correlated, stats)
+    graph(correlated, stats)
 
 def stdin_read():
     d = ''
