@@ -184,14 +184,13 @@ def paint(data, stats):
             svg.line(20, y1, 500, y2)
             #print("    client -> [{:.3f} ms] -> server".format(diff.total_seconds() * 1000.0))
     svg_path = 'drawing.svg'
-    print("write SVG image to {}".format(svg_path))
+    print("save SVG image to {}".format(svg_path))
     svg.write(filepath=svg_path)
 
-def graph(data, stats):
+def graph_delay(data, stats):
     fig = plt.figure()
     subplots_adjust(hspace=0.000)
     number_of_subplots = len(data.items())
-
     v = 1
     for stream_id, stream_data in data.items():
         x = list(); y = list()
@@ -214,10 +213,30 @@ def graph(data, stats):
         ax1.plot(x, y)
         ax1.scatter(x, y, color='blue')
         v += 1
-
-    svg_path = 'chart.png'
-    print("write SVG image to {}".format(svg_path))
+    svg_path = 'graph-delay.png'
+    print("save delay graph to {}".format(svg_path))
     fig.savefig(svg_path, bbox_inches='tight')
+
+def graph_histogram(data, stats):
+    bins = 30
+    x = list()
+    for stream_id, stream_data in data.items():
+        for seq_no in sorted(stream_data):
+            entry = stream_data[seq_no]
+            duration = entry['server']['time'] - entry['client']['time']
+            duration_sec = duration.total_seconds()
+            x.append(duration_sec * 1000)
+    fig = plt.figure()
+    plt.hist(x, bins)
+    plt.xlabel('Packet Delay [ms]')
+    #plt.ylabel('Test Runs [#]')
+    svg_path = 'graph-histogram.png'
+    print("save historgram graph to {}".format(svg_path))
+    fig.savefig(svg_path, bbox_inches='tight')
+
+def graph(data, stats):
+    graph_delay(data, stats)
+    graph_histogram(data, stats)
 
 def process(data):
     check_data(data)
