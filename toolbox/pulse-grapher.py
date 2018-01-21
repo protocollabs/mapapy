@@ -229,7 +229,6 @@ def graph_histogram(data, stats):
     fig = plt.figure()
     plt.hist(x, bins)
     plt.xlabel('Packet Delay [ms]')
-    #plt.ylabel('Test Runs [#]')
     svg_path = 'graph-histogram.png'
     print("save historgram graph to {}".format(svg_path))
     fig.savefig(svg_path, bbox_inches='tight')
